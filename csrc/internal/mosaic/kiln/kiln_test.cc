@@ -36,6 +36,7 @@
 #include "csrc/common/error_utils.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
 #include "xla/hlo/testlib/filecheck.h"
 
@@ -978,6 +979,67 @@ TEST(KilnTest, ForLoopWithInductionVarAndBounds) {
     CHECK:             tpu.vector_store %[[OUT]]
     CHECK:           }
     CHECK:         }
+  )"));
+}
+
+TEST(KilnTest, ForLoopWithCarriedState) {
+  absl::StatusOr<Kernel> kernel = CreateKernel(
+      GridSpec{.name = "for_carry", .grid = {1}}, InSpec{f32(8, 128)},
+      OutSpec{f32(8, 128)}, [](Ref in, Ref out) {
+        // Carry a scalar and a tile through four iterations.
+        const StateVector final_state =
+            For(0, 4, 1, {I32(1), Tile(in)},
+                [&](Scalar, llvm::ArrayRef<StateValue> state) -> StateVector {
+                  return {std::get<Scalar>(state[0]) + 2,
+                          std::get<Tile>(state[1]) + Tile(in)};
+                });
+        out = std::get<Tile>(final_state[1]) *
+              std::get<Scalar>(final_state[0]).ToF32();
+      });
+  EXPECT_THAT(kernel, IsOkAndMatchesIr(R"(
+    CHECK-LABEL: func.func @for_carry(
+    CHECK:         %[[ONE:.*]] = arith.constant 1 : i32
+    CHECK:         %[[IN:.*]] = vector.load
+    CHECK:         %[[RES:.*]]:2 = scf.for %{{.*}} = %{{.*}} to %{{.*}} step %{{.*}} iter_args(%[[S:.*]] = %[[ONE]], %[[T:.*]] = %[[IN]]) -> (i32, vector<8x128xf32>) {
+    CHECK:           %[[S2:.*]] = arith.addi %[[S]], %{{.*}} : i32
+    CHECK:           %[[T2:.*]] = arith.addf %[[T]], %{{.*}} : vector<8x128xf32>
+    CHECK:           scf.yield %[[S2]], %[[T2]] : i32, vector<8x128xf32>
+    CHECK:         }
+    CHECK:         arith.sitofp %[[RES]]#0 : i32 to f32
+    CHECK:         arith.mulf %[[RES]]#1, %{{.*}} : vector<8x128xf32>
+  )"));
+}
+
+// An i32 -> u32 swap keeps the MLIR type, so only Kiln can catch it.
+TEST(KilnTest, ForLoopRejectsChangedStateDtype) {
+  absl::StatusOr<Kernel> kernel = CreateKernel(
+      GridSpec{.name = "for_carry_dtype", .grid = {1}}, InSpec{f32(8, 128)},
+      OutSpec{f32(8, 128)}, [](Ref, Ref) {
+        EXPECT_DEATH(
+            For(0, 4, 1, {I32(0)},
+                [](Scalar i, llvm::ArrayRef<StateValue>) -> StateVector {
+                  return {i.AsType(u32)};
+                }),
+            "For\\(\\) state value 0 changed dtype: expected i32, got u32");
+      });
+  ASSERT_THAT(kernel, IsOk());
+}
+
+TEST(KilnTest, ForLoopWithEmptyState) {
+  absl::StatusOr<Kernel> kernel = CreateKernel(
+      GridSpec{.name = "for_empty_carry", .grid = {1}}, InSpec{f32(8, 128)},
+      OutSpec{f32(8, 128)}, [](Ref in, Ref out) {
+        EXPECT_TRUE(For(0, 4, 1, {},
+                        [&](Scalar, llvm::ArrayRef<StateValue>) -> StateVector {
+                          out = Tile(in);
+                          return {};
+                        })
+                        .empty());
+      });
+  EXPECT_THAT(kernel, IsOkAndMatchesIr(R"(
+    CHECK:     scf.for
+    CHECK:       tpu.vector_store {{.*}}
+    CHECK-NEXT:  }
   )"));
 }
 
@@ -2086,7 +2148,7 @@ TEST(KilnTest, EmitPipeline) {
         acc = Zeros(acc.shape());
         EmitPipeline(0, in.Dim(0) / kBlock, {std::move(input)},
                      /*outputs=*/{}, [&](const PipelineStep& s) {
-                       acc = Tile(acc) + Tile(s.inputs[0]);
+                       acc = Tile(acc) + Tile(s.inputs[0].ref);
                      });
         AsyncCopy(acc, out, AllocaDmaSemaphore()).Wait();
       });
@@ -2132,7 +2194,8 @@ TEST(KilnTest, EmitPipelineWithTwo2dInputs) {
                      {{.hbm = a, .block_shape = {8, 128}, .region = rows},
                       {.hbm = b, .block_shape = {8, 128}, .region = rows}},
                      /*outputs=*/{}, [&](const PipelineStep& s) {
-                       acc = Tile(acc) + Tile(s.inputs[0]) * Tile(s.inputs[1]);
+                       acc = Tile(acc) +
+                             Tile(s.inputs[0].ref) * Tile(s.inputs[1].ref);
                      });
         AsyncCopy(acc, out, AllocaDmaSemaphore()).Wait();
       });
@@ -2187,7 +2250,7 @@ TEST(KilnTest, EmitPipelineWithOutputs) {
                 {{.hbm = in, .block_shape = {kBlock}, .region = block}},
                 {{.hbm = out, .block_shape = {kBlock}, .region = block}},
                 [&](const PipelineStep& s) {
-                  Store(s.outputs[0], Tile(s.inputs[0]) * 2.0);
+                  Store(s.outputs[0].ref, Tile(s.inputs[0].ref) * 2.0);
                 });
           }),
       IsOkAndMatchesIr(R"(
@@ -2204,12 +2267,12 @@ TEST(KilnTest, EmitPipelineWithOutputs) {
     CHECK:               scf.if
     CHECK:                 tpu.enqueue_dma source(%{{.*}} : memref<128xf32, #tpu.memory_space<hbm>>)
     CHECK:               tpu.wait_dma source(%{{.*}} : memref<128xf32, #tpu.memory_space<hbm>>)
+    CHECK:               %[[IN_SLOT:.*]] = tpu.memref_slice %[[IN_SLOTS]]
     CHECK:               scf.if
     CHECK-DAG:             %[[REUSE_SRC:.*]] = tpu.memref_slice %[[OUT_SLOTS]]
     CHECK-DAG:             %[[REUSE_DST:.*]] = tpu.memref_slice %[[OUT]]
     CHECK-DAG:             tpu.memref_slice %[[OUT_SEMS]]
     CHECK:                 tpu.wait_dma source(%[[REUSE_SRC]] : {{.*}}) target(%[[REUSE_DST]] : {{.*}})
-    CHECK:               %[[IN_SLOT:.*]] = tpu.memref_slice %[[IN_SLOTS]]
     CHECK:               %[[OUT_SLOT:.*]] = tpu.memref_slice %[[OUT_SLOTS]]
     CHECK:               vector.load %[[IN_SLOT]]
     CHECK:               arith.mulf
@@ -2226,6 +2289,55 @@ TEST(KilnTest, EmitPipelineWithOutputs) {
     CHECK:             tpu.memref_slice %[[OUT_SEMS]]
     CHECK:             tpu.wait_dma source({{.*}}vmem>>) target({{.*}}hbm>>)
     CHECK:           tpu.yield
+  )"));
+}
+
+TEST(KilnTest, EmitPipelineContraction) {
+  auto rows = [](Scalar i) {
+    return BlockRegion{.offsets = {i * 8, 0}, .sizes = {8, 128}};
+  };
+  absl::StatusOr<Kernel> kernel = CreateKernel(
+      GridSpec{.name = "pipeline_contraction"}, InSpec::Hbm(f32(kDynamic, 128)),
+      OutSpec::Hbm(f32(kDynamic, 128)), [&](Ref in, Ref out) {
+        EmitPipeline(0, in.Dim(0) / 8,
+                     {{.hbm = in, .block_shape = {8, 128}, .region = rows}},
+                     {{.hbm = out,
+                       .block_shape = {8, 128},
+                       .block_index = [](Scalar step) { return step / 2; },
+                       .region = rows}},
+                     [&](const PipelineStep& s) {
+                       Ref acc = s.outputs[0].ref;
+                       If(s.outputs[0].is_first_step,
+                          [&] { acc = Zeros(acc.shape()); });
+                       acc = Tile(acc) + Tile(s.inputs[0].ref);
+                     });
+      });
+
+  // One block index is computed per step and carried to the next. A new block
+  // flips the slot and waits for that slot's previous copy out; the body writes
+  // the slot, which is copied out on the block's last step. The last two copies
+  // are waited for after the loop.
+  EXPECT_THAT(kernel, IsOkAndMatchesIr(R"(
+    CHECK-LABEL: func.func @pipeline_contraction(
+    CHECK:           memref.alloca() : memref<2x8x128xf32, #tpu.memory_space<vmem>>
+    CHECK:           %[[OUT_SLOTS:.*]] = memref.alloca() : memref<2x8x128xf32, #tpu.memory_space<vmem>>
+    CHECK:             scf.for {{.*}} iter_args(%[[BLOCK:.*]] = %{{.*}}, %[[SLOT:.*]] = %{{.*}}, %[[CUR:.*]] = %{{.*}}, %{{.*}} = %{{.*}}, %{{.*}} = %{{.*}}) -> (i32, i32, i32, i32, i32)
+    CHECK-NOT:           arith.divsi
+    CHECK:               %[[NEXT:.*]] = arith.divsi
+    CHECK-NOT:           arith.divsi
+    CHECK:               %[[CHANGED:.*]] = arith.cmpi ne, %[[CUR]], %[[BLOCK]]
+    CHECK:               %[[NEW_SLOT:.*]] = arith.select %[[CHANGED]], %{{.*}}, %[[SLOT]]
+    CHECK:               scf.if
+    CHECK:                 tpu.wait_dma source({{.*}}vmem>>) target({{.*}}hbm>>)
+    CHECK:               tpu.memref_slice %[[OUT_SLOTS]][%[[NEW_SLOT]],
+    CHECK:               arith.cmpi ne, %[[NEXT]], %[[CUR]]
+    CHECK:               tpu.vector_store
+    CHECK:               scf.if
+    CHECK:                 tpu.enqueue_dma source({{.*}}vmem>>) target({{.*}}hbm>>)
+    CHECK:               scf.yield %[[CUR]], %[[NEW_SLOT]], %[[NEXT]],
+    CHECK:             scf.if
+    CHECK:               tpu.wait_dma
+    CHECK:             tpu.wait_dma
   )"));
 }
 
