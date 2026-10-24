@@ -16,6 +16,8 @@
 
 #include "csrc/eager/materialize.h"
 
+#include <cstdint>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -55,6 +57,7 @@
 #include "stablehlo/integrations/cpp/builder/AttrTypeBuilderUtil.h"
 #include "stablehlo/integrations/cpp/builder/MlirBuilder.h"
 #include "stablehlo/integrations/cpp/builder/StablehloBuilder.h"
+#include "xla/pjrt/pjrt_client.h"
 
 namespace torch_tpu {
 namespace {
@@ -81,6 +84,10 @@ class MaterializeTest : public testing::Test {
     CompilationCache::ShutDown();
     PjrtBackend::GetInstance().Shutdown();
   }
+
+  void SetUp() override { ClearAllStreams(); }
+
+  void TearDown() override { ClearAllStreams(); }
 };
 
 TEST_F(MaterializeTest, EmptyListNoOpSuccess) {
@@ -142,6 +149,226 @@ TEST_F(MaterializeTest, CompilerOptionsPropagateToMaterializeThread) {
   const PerfStats stats = CompilationCache::GetInstance().GetCacheStats();
   ASSERT_EQ(stats.per_entry_stats.size(), 1);
   EXPECT_EQ(stats.per_entry_stats[0].key.compile_options_key(), expected_key);
+}
+
+TEST_F(MaterializeTest, SnapshotAwaitsAllPriorOutputsInOrder) {
+  const ScopedPythonContextCapturer capturer(OpName::kAdd);
+  const auto [device_index, stream_id] = GetCurrentDeviceStreamId();
+  const Shape shape(Dimensions{16}, mlir::ElementType::F32);
+  const int64_t initial_cache_reqs =
+      CompilationCache::GetInstance().GetCacheRequests();
+
+  const auto const_builder =
+      [shape](
+          mlir::MlirBuilder& builder,
+          absl::Span<mlir::MlirOp>) -> absl::StatusOr<DynamicMlirOpResults> {
+    return DynamicMlirOpResults{
+        BuildFillUninitialized(builder, shape.dtype(), shape.dimensions())};
+  };
+
+  // Enqueue three independent device ops on the same stream (with kSplitBoth so
+  // each compiles into a separate ExecutionTask without data dependencies).
+  TT_ASSERT_OK_AND_ASSIGN(
+      const std::vector<DeviceBufferRef> refs_1,
+      DeviceBufferList::CreateDeferred(OpName::kAdd, const_builder,
+                                       /*inputs=*/{}, OpParamCacheKeys::Empty(),
+                                       {shape}, OpSplitMode::kSplitBoth));
+  const DeviceBufferRef ref_1 = refs_1[0];
+  const at::Tensor t_1 = MakeTensor(ref_1);
+  RecordDeferredOpCreated(ref_1.device_buffer_list());
+
+  TT_ASSERT_OK_AND_ASSIGN(
+      const std::vector<DeviceBufferRef> refs_2,
+      DeviceBufferList::CreateDeferred(OpName::kAdd, const_builder,
+                                       /*inputs=*/{}, OpParamCacheKeys::Empty(),
+                                       {shape}, OpSplitMode::kSplitBoth));
+  const DeviceBufferRef ref_2 = refs_2[0];
+  const at::Tensor t_2 = MakeTensor(ref_2);
+  RecordDeferredOpCreated(ref_2.device_buffer_list());
+
+  TT_ASSERT_OK_AND_ASSIGN(
+      const std::vector<DeviceBufferRef> refs_3,
+      DeviceBufferList::CreateDeferred(OpName::kAdd, const_builder,
+                                       /*inputs=*/{}, OpParamCacheKeys::Empty(),
+                                       {shape}, OpSplitMode::kSplitBoth));
+  const DeviceBufferRef ref_3 = refs_3[0];
+  const at::Tensor t_3 = MakeTensor(ref_3);
+  RecordDeferredOpCreated(ref_3.device_buffer_list());
+
+  auto snapshot_future = MaterializeStream(device_index, stream_id,
+                                           MaterializationReason::kExplicitSync,
+                                           GraphSplitMode::kSplitGraph);
+  TT_ASSERT_OK_AND_ASSIGN(const std::shared_ptr<EventSnapshot> snapshot,
+                          snapshot_future.Await());
+  ASSERT_EQ(snapshot->Synchronize(), absl::OkStatus());
+  EXPECT_EQ(
+      CompilationCache::GetInstance().GetCacheRequests() - initial_cache_reqs,
+      3);
+
+  for (const DeviceBufferRef& ref : {ref_1, ref_2, ref_3}) {
+    EXPECT_TRUE(ref.is_materialized());
+    TT_ASSERT_OK_AND_ASSIGN(xla::PjRtBuffer* const buffer, ref.AwaitBuffer());
+    EXPECT_TRUE(buffer->GetReadyFuture().IsKnownReady());
+    EXPECT_EQ(buffer->GetReadyFuture().Await(), absl::OkStatus());
+  }
+}
+
+TEST_F(MaterializeTest, SnapshotAwaitsLastDeviceOutputFromPreviousBatch) {
+  const ScopedPythonContextCapturer capturer(OpName::kAdd);
+  const auto [device_index, stream_id] = GetCurrentDeviceStreamId();
+  const Shape shape(Dimensions{16}, mlir::ElementType::F32);
+
+  const auto const_builder =
+      [shape](
+          mlir::MlirBuilder& builder,
+          absl::Span<mlir::MlirOp>) -> absl::StatusOr<DynamicMlirOpResults> {
+    return DynamicMlirOpResults{
+        BuildFillUninitialized(builder, shape.dtype(), shape.dimensions())};
+  };
+
+  TT_ASSERT_OK_AND_ASSIGN(
+      const std::vector<DeviceBufferRef> refs,
+      DeviceBufferList::CreateDeferred(OpName::kAdd, const_builder,
+                                       /*inputs=*/{}, OpParamCacheKeys::Empty(),
+                                       {shape}));
+  const DeviceBufferRef ref = refs[0];
+  const at::Tensor t = MakeTensor(ref);
+  RecordDeferredOpCreated(ref.device_buffer_list());
+
+  // Trigger a graph break and wait for the MaterializationTask to finish
+  // compiling and writing back `last_device_output` without a SnapshotRequest.
+  ASSERT_EQ(Materialize(ref, MaterializationReason::kExplicitSync,
+                        GraphSplitMode::kSplitGraph,
+                        MaterializationBlockMode::kBlockUntilStarted),
+            absl::OkStatus());
+
+  // Now request an EventSnapshot on the same stream with no new deferred ops.
+  // The snapshot must await the `last_device_output` written back from the
+  // previous MaterializationTask batch.
+  auto snapshot_future = MaterializeStream(
+      device_index, stream_id, MaterializationReason::kExplicitSync);
+  TT_ASSERT_OK_AND_ASSIGN(const std::shared_ptr<EventSnapshot> snapshot,
+                          snapshot_future.Await());
+  ASSERT_EQ(snapshot->Synchronize(), absl::OkStatus());
+  EXPECT_TRUE(ref.is_materialized());
+  TT_ASSERT_OK_AND_ASSIGN(xla::PjRtBuffer* const buffer, ref.AwaitBuffer());
+  EXPECT_TRUE(buffer->GetReadyFuture().IsKnownReady());
+  EXPECT_EQ(buffer->GetReadyFuture().Await(), absl::OkStatus());
+}
+
+TEST_F(MaterializeTest, DeletedBufferResolvesReadyFutureAndSnapshotOk) {
+  const ScopedPythonContextCapturer capturer(OpName::kAdd);
+  const auto [device_index, stream_id] = GetCurrentDeviceStreamId();
+  const Shape shape(Dimensions{16}, mlir::ElementType::F32);
+
+  const auto const_builder =
+      [shape](
+          mlir::MlirBuilder& builder,
+          absl::Span<mlir::MlirOp>) -> absl::StatusOr<DynamicMlirOpResults> {
+    return DynamicMlirOpResults{
+        BuildFillUninitialized(builder, shape.dtype(), shape.dimensions())};
+  };
+
+  TT_ASSERT_OK_AND_ASSIGN(
+      const std::vector<DeviceBufferRef> refs,
+      DeviceBufferList::CreateDeferred(OpName::kAdd, const_builder,
+                                       /*inputs=*/{}, OpParamCacheKeys::Empty(),
+                                       {shape}));
+  const DeviceBufferRef ref = refs[0];
+  const at::Tensor t = MakeTensor(ref);
+  RecordDeferredOpCreated(ref.device_buffer_list());
+
+  // Materialize `ref` without a SnapshotRequest so `ref` is stored as the
+  // stream's `last_device_output_`.
+  ASSERT_EQ(Materialize(ref, MaterializationReason::kExplicitSync,
+                        GraphSplitMode::kSplitGraph,
+                        MaterializationBlockMode::kBlockUntilStarted),
+            absl::OkStatus());
+  TT_ASSERT_OK_AND_ASSIGN(xla::PjRtBuffer* const buffer, ref.AwaitBuffer());
+  ASSERT_EQ(buffer->GetReadyFuture().Await(), absl::OkStatus());
+
+  // Delete the underlying PjRtBuffer (simulating an in-place donation before
+  // any EventSnapshot is recorded). Raw PJRT `GetReadyFuture()` now returns an
+  // error, whereas `DeviceBufferRef::GetReadyFuture()` and `EventSnapshot`
+  // must resolve with `absl::OkStatus()`.
+  buffer->Delete();
+  ASSERT_TRUE(buffer->IsDeleted());
+  EXPECT_FALSE(buffer->GetReadyFuture().Await().ok());
+  EXPECT_EQ(ref.GetReadyFuture().Await(), absl::OkStatus());
+
+  auto snapshot_future = MaterializeStream(
+      device_index, stream_id, MaterializationReason::kExplicitSync);
+  TT_ASSERT_OK_AND_ASSIGN(const std::shared_ptr<EventSnapshot> snapshot,
+                          snapshot_future.Await());
+  EXPECT_EQ(snapshot->Synchronize(), absl::OkStatus());
+}
+
+TEST_F(MaterializeTest, CompiledExecutionPreservesPriorLastDeviceOutput) {
+  const ScopedPythonContextCapturer capturer(OpName::kAdd);
+  const auto [device_index, stream_id] = GetCurrentDeviceStreamId();
+  const Shape shape(Dimensions{16}, mlir::ElementType::F32);
+
+  CompilationCache::GetInstance().EvictAll();
+
+  const auto const_builder =
+      [shape](
+          mlir::MlirBuilder& builder,
+          absl::Span<mlir::MlirOp>) -> absl::StatusOr<DynamicMlirOpResults> {
+    return DynamicMlirOpResults{
+        BuildFillUninitialized(builder, shape.dtype(), shape.dimensions())};
+  };
+
+  TT_ASSERT_OK_AND_ASSIGN(
+      const std::vector<DeviceBufferRef> refs_tc,
+      DeviceBufferList::CreateDeferred(OpName::kAdd, const_builder,
+                                       /*inputs=*/{}, OpParamCacheKeys::Empty(),
+                                       {shape}));
+  const DeviceBufferRef ref_tc = refs_tc[0];
+  const at::Tensor t_tc = MakeTensor(ref_tc);
+  RecordDeferredOpCreated(ref_tc.device_buffer_list());
+
+  // Materialize the TensorCore eager op so `ref_tc` is written back as
+  // `StreamState::last_device_output_`.
+  ASSERT_EQ(Materialize(ref_tc, MaterializationReason::kExplicitSync,
+                        GraphSplitMode::kSplitGraph,
+                        MaterializationBlockMode::kBlockUntilStarted),
+            absl::OkStatus());
+
+  const PerfStats stats = CompilationCache::GetInstance().GetCacheStats();
+  ASSERT_EQ(stats.per_entry_stats.size(), 1);
+  TT_ASSERT_OK_AND_ASSIGN(
+      const CompiledKernel compiled_kernel,
+      CompilationCache::GetInstance().GetOrCompile(
+          stats.per_entry_stats[0].key, /*input_shapes=*/{}, {shape},
+          /*computation_builder=*/{}, xla::CompileOptions{}));
+  TT_ASSERT_OK_AND_ASSIGN(const SharedLoadedExecutableWithMetadata executable,
+                          compiled_kernel.fixed_shape_kernel.get());
+
+  // Enqueue a CompiledExecution (`DeviceOutputTracking::kRecordReadyFuture`)
+  // and wait until `execute_thread_` has materialized its output (which
+  // happens strictly after `materialize_thread_` calls
+  // `WriteBackMaterializationFutures`).
+  TT_ASSERT_OK_AND_ASSIGN(const std::vector<DeviceBufferRef> compiled_outputs,
+                          EnqueueExecutable(executable, /*arguments=*/{},
+                                            {shape}, "test_compiled"));
+  ASSERT_EQ(compiled_outputs.size(), 1);
+  ASSERT_EQ(compiled_outputs[0].GetMaterializationFuture().Await(),
+            absl::OkStatus());
+
+  // Recording a snapshot without waking `MaterializationWorker` lets us
+  // inspect `SnapshotRequest` directly: `last_device_output` must still be
+  // `ref_tc` (preserved rather than overwritten by `compiled_outputs[0]`).
+  auto snapshot_future = EventSnapshot::Record(device_index, stream_id);
+  auto ready_work = GetReadyWork(device_index, stream_id);
+  ASSERT_EQ(ready_work.size(), 1);
+  ASSERT_TRUE(std::holds_alternative<SnapshotRequest>(ready_work[0]));
+  auto& snapshot_request = std::get<SnapshotRequest>(ready_work[0]);
+  ASSERT_TRUE(snapshot_request.last_device_output.has_value());
+  EXPECT_EQ(*snapshot_request.last_device_output, ref_tc);
+  EXPECT_EQ(compiled_outputs[0].Synchronize(), absl::OkStatus());
+  snapshot_request.snapshot_promise.Set(
+      std::make_shared<EventSnapshot>(xla::Future<void>(absl::OkStatus())));
+  EXPECT_EQ(snapshot_future.Await().status(), absl::OkStatus());
 }
 
 TEST_F(MaterializeTest, OutOfOrderUnexecutedDeferred) {

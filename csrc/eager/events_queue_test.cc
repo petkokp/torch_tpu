@@ -595,6 +595,158 @@ TEST_F(EventsQueueTest, PrunesSuccessfulCompletedFutures) {
   EXPECT_TRUE(snapshot_request.futures.empty());
 }
 
+TEST_F(EventsQueueTest, WriteBackLastDeviceOutputAttachesToNextSnapshot) {
+  ClearAllStreams();
+  const ScopedPythonContextCapturer capturer(OpName::kEmpty);
+  const Shape shape(Dimensions{8}, mlir::ElementType::F32);
+  const auto [device_index, stream_id] = GetCurrentDeviceStreamId();
+
+  TT_ASSERT_OK_AND_ASSIGN(
+      const std::vector<DeviceBufferRef> refs_a,
+      DeviceBufferList::CreateDeferred(OpName::kAdd, DummyBuilder, {},
+                                       OpParamCacheKeys::Empty(), {shape}));
+  const DeviceBufferRef ref_a = refs_a[0];
+
+  // Write back only a `last_device_output` (with empty `futures`), simulating
+  // a MaterializationTask that processed a graph break without a trailing
+  // SnapshotRequest.
+  WriteBackMaterializationFutures(device_index, stream_id, /*futures=*/{},
+                                  ref_a);
+
+  // Recording a snapshot with no new deferred ops should still be treated as
+  // meaningful work because `last_device_output_` is populated, and should
+  // transfer `ref_a` into the new SnapshotRequest while clearing
+  // `last_device_output_`.
+  auto snapshot_future_1 = EventSnapshot::Record(device_index, stream_id);
+  // Recording a second snapshot immediately with no new work should reuse the
+  // first snapshot's promise because `last_device_output_` was consumed.
+  auto snapshot_future_2 = EventSnapshot::Record(device_index, stream_id);
+
+  auto ready_work = GetReadyWork(device_index, stream_id);
+  ASSERT_EQ(ready_work.size(), 1);
+  ASSERT_TRUE(std::holds_alternative<SnapshotRequest>(ready_work[0]));
+  auto& snapshot_request = std::get<SnapshotRequest>(ready_work[0]);
+  ASSERT_TRUE(snapshot_request.last_device_output.has_value());
+  EXPECT_EQ(*snapshot_request.last_device_output, ref_a);
+
+  const auto resolved_snapshot =
+      std::make_shared<EventSnapshot>(xla::Future<void>(absl::OkStatus()));
+  snapshot_request.snapshot_promise.Set(resolved_snapshot);
+  TT_ASSERT_OK_AND_ASSIGN(const auto snap_1, snapshot_future_1.Await());
+  TT_ASSERT_OK_AND_ASSIGN(const auto snap_2, snapshot_future_2.Await());
+  EXPECT_EQ(snap_1, snap_2);
+}
+
+TEST_F(EventsQueueTest, WriteBackAttachesToPendingSnapshotRequest) {
+  ClearAllStreams();
+  const ScopedPythonContextCapturer capturer(OpName::kEmpty);
+  const Shape shape(Dimensions{8}, mlir::ElementType::F32);
+  const auto [device_index, stream_id] = GetCurrentDeviceStreamId();
+
+  TT_ASSERT_OK_AND_ASSIGN(
+      const std::vector<DeviceBufferRef> refs_a,
+      DeviceBufferList::CreateDeferred(OpName::kAdd, DummyBuilder, {},
+                                       OpParamCacheKeys::Empty(), {shape}));
+  const DeviceBufferRef ref_a = refs_a[0];
+  RecordDeferredOpCreated(ref_a.device_buffer_list());
+  (void)EventSnapshot::Record(device_index, stream_id);
+
+  TT_ASSERT_OK_AND_ASSIGN(
+      const std::vector<DeviceBufferRef> refs_b,
+      DeviceBufferList::CreateDeferred(OpName::kAdd, DummyBuilder, {},
+                                       OpParamCacheKeys::Empty(), {shape}));
+  const DeviceBufferRef ref_b = refs_b[0];
+  auto [promise, future] = xla::MakePromise<void>();
+  std::vector<xla::Future<void>> writeback_futures = {std::move(future)};
+
+  // When a SnapshotRequest is already queued in `ready_work_`,
+  // WriteBackMaterializationFutures attaches both the futures and
+  // `last_device_output` directly to that pending SnapshotRequest.
+  WriteBackMaterializationFutures(device_index, stream_id,
+                                  std::move(writeback_futures), ref_b);
+
+  const auto ready_work = GetReadyWork(device_index, stream_id);
+  ASSERT_EQ(ready_work.size(), 2);
+  ASSERT_TRUE(std::holds_alternative<SnapshotRequest>(ready_work[1]));
+  const auto& snapshot_request = std::get<SnapshotRequest>(ready_work[1]);
+  EXPECT_EQ(snapshot_request.futures.size(), 1);
+  ASSERT_TRUE(snapshot_request.last_device_output.has_value());
+  EXPECT_EQ(*snapshot_request.last_device_output, ref_b);
+  promise.Set(absl::OkStatus());
+}
+
+TEST_F(EventsQueueTest, WriteBackOverwritesLastDeviceOutput) {
+  ClearAllStreams();
+  const ScopedPythonContextCapturer capturer(OpName::kEmpty);
+  const Shape shape(Dimensions{8}, mlir::ElementType::F32);
+  const auto [device_index, stream_id] = GetCurrentDeviceStreamId();
+
+  TT_ASSERT_OK_AND_ASSIGN(
+      const std::vector<DeviceBufferRef> refs_a,
+      DeviceBufferList::CreateDeferred(OpName::kAdd, DummyBuilder, {},
+                                       OpParamCacheKeys::Empty(), {shape}));
+  TT_ASSERT_OK_AND_ASSIGN(
+      const std::vector<DeviceBufferRef> refs_b,
+      DeviceBufferList::CreateDeferred(OpName::kAdd, DummyBuilder, {},
+                                       OpParamCacheKeys::Empty(), {shape}));
+  TT_ASSERT_OK_AND_ASSIGN(
+      const std::vector<DeviceBufferRef> refs_c,
+      DeviceBufferList::CreateDeferred(OpName::kAdd, DummyBuilder, {},
+                                       OpParamCacheKeys::Empty(), {shape}));
+
+  // 1. Consecutive write-backs with no pending SnapshotRequest overwrite
+  // `StreamState::last_device_output_` with the newer output.
+  WriteBackMaterializationFutures(device_index, stream_id, /*futures=*/{},
+                                  refs_a[0]);
+  WriteBackMaterializationFutures(device_index, stream_id, /*futures=*/{},
+                                  refs_b[0]);
+
+  (void)EventSnapshot::Record(device_index, stream_id);
+  // 2. Subsequent write-backs while a SnapshotRequest is pending overwrite
+  // `snapshot_request.last_device_output` with the newer output (`refs_c[0]`),
+  // while `std::nullopt` preserves it.
+  auto [promise_1, future_1] = xla::MakePromise<void>();
+  auto [promise_2, future_2] = xla::MakePromise<void>();
+  std::vector<xla::Future<void>> futures_1 = {std::move(future_1)};
+  std::vector<xla::Future<void>> futures_2 = {std::move(future_2)};
+  WriteBackMaterializationFutures(device_index, stream_id, std::move(futures_1),
+                                  refs_c[0]);
+  WriteBackMaterializationFutures(device_index, stream_id, std::move(futures_2),
+                                  /*last_device_output=*/std::nullopt);
+
+  const auto ready_work = GetReadyWork(device_index, stream_id);
+  ASSERT_EQ(ready_work.size(), 1);
+  ASSERT_TRUE(std::holds_alternative<SnapshotRequest>(ready_work[0]));
+  const auto& snapshot_request = std::get<SnapshotRequest>(ready_work[0]);
+  EXPECT_EQ(snapshot_request.futures.size(), 2);
+  ASSERT_TRUE(snapshot_request.last_device_output.has_value());
+  EXPECT_EQ(*snapshot_request.last_device_output, refs_c[0]);
+  promise_1.Set(absl::OkStatus());
+  promise_2.Set(absl::OkStatus());
+}
+
+TEST_F(EventsQueueTest, ClearAllStreamsResetsLastDeviceOutput) {
+  ClearAllStreams();
+  const ScopedPythonContextCapturer capturer(OpName::kEmpty);
+  const Shape shape(Dimensions{8}, mlir::ElementType::F32);
+  const auto [device_index, stream_id] = GetCurrentDeviceStreamId();
+
+  TT_ASSERT_OK_AND_ASSIGN(
+      const std::vector<DeviceBufferRef> refs_a,
+      DeviceBufferList::CreateDeferred(OpName::kAdd, DummyBuilder, {},
+                                       OpParamCacheKeys::Empty(), {shape}));
+  WriteBackMaterializationFutures(device_index, stream_id, /*futures=*/{},
+                                  refs_a[0]);
+  ClearAllStreams();
+
+  (void)EventSnapshot::Record(device_index, stream_id);
+  const auto ready_work = GetReadyWork(device_index, stream_id);
+  ASSERT_EQ(ready_work.size(), 1);
+  ASSERT_TRUE(std::holds_alternative<SnapshotRequest>(ready_work[0]));
+  const auto& snapshot_request = std::get<SnapshotRequest>(ready_work[0]);
+  EXPECT_FALSE(snapshot_request.last_device_output.has_value());
+}
+
 TEST_F(EventsQueueTest, StreamMustMaterializeEmptyTensors) {
   ClearAllStreams();
   ScopedPythonContextCapturer capturer(OpName::kEmpty);

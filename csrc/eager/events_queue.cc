@@ -173,21 +173,26 @@ class StreamState {
   // Clears all tracked DeviceBufferLists from the events queue, and resets the
   // repeated ops heuristic state.
   void Clear() {
+    // Destroy any cleared ReadyWork items and `last_device_output_` outside
+    // `mu_` so `~PjRtCApiBuffer()` is never invoked while holding
+    // `StreamState::mu_`.
+    std::vector<ReadyWork> old_ready_work;
+    std::optional<DeviceBufferRef> old_device_output;
     absl::MutexLock lock(mu_);
     repetition_hashes_.clear();
     repetition_i_ = 0;
     repeated_ops_graph_breaks_suspended_ = false;
     repeated_ops_graph_break_requested_ = false;
     // Drop all unresolved SnapshotEvents and fail their promises.
-    absl::Status cancel_status = TT_ERROR(error::kCancelled)
-                                 << "stream state was cleared";
+    const absl::Status cancel_status = TT_ERROR(error::kCancelled)
+                                       << "stream state was cleared";
     for (auto& ready_work_item : ready_work_) {
       if (auto* snapshot_request =
               std::get_if<SnapshotRequest>(&ready_work_item)) {
         snapshot_request->snapshot_promise.Set(cancel_status);
       }
     }
-    ready_work_.clear();
+    old_ready_work.swap(ready_work_);
 
     // At this point, there are no "live nodes" holding onto deferred ops, so
     // all ops that have no side effects (directly or indirectly) should be
@@ -202,6 +207,7 @@ class StreamState {
       deferred_op_event.deferred_op_hash = 0;
     }
     futures_.clear();
+    old_device_output = std::exchange(last_device_output_, std::nullopt);
     last_snapshot_future_ = xla::Future<void>(absl::OkStatus());
   }
 
@@ -391,7 +397,11 @@ class StreamState {
   }
 
   void WriteBackMaterializationFutures(
-      std::vector<xla::Future<void>>&& futures) {
+      std::vector<xla::Future<void>>&& futures,
+      std::optional<DeviceBufferRef> last_device_output) {
+    // Destroy any replaced DeviceBufferRef outside `mu_` so `~PjRtCApiBuffer()`
+    // is never invoked while holding `StreamState::mu_`.
+    std::optional<DeviceBufferRef> old_device_output;
     absl::MutexLock lock(mu_);
     for (auto& ready_work_item : ready_work_) {
       if (auto* snapshot_request =
@@ -400,11 +410,20 @@ class StreamState {
         existing_futures.insert(existing_futures.end(),
                                 std::make_move_iterator(futures.begin()),
                                 std::make_move_iterator(futures.end()));
+        if (last_device_output.has_value()) {
+          old_device_output =
+              std::exchange(snapshot_request->last_device_output,
+                            std::move(last_device_output));
+        }
         return;
       }
     }
     futures_.insert(futures_.end(), std::make_move_iterator(futures.begin()),
                     std::make_move_iterator(futures.end()));
+    if (last_device_output.has_value()) {
+      old_device_output =
+          std::exchange(last_device_output_, std::move(last_device_output));
+    }
   }
 
  private:
@@ -535,12 +554,13 @@ class StreamState {
     InsertGraphBreakLocked(std::move(must_materialize), reason, mode,
                            eager_mode, std::nullopt);
     // Check if this event snapshot is a no-op.
-    // An event snapshot is meaningful only if it has futures to wait on,
-    // must-execute deferred ops, must_materialize deferred constants (which
-    // bypass insertion into deferred_ops_), or a compiled execution task which
-    // have been recorded since the last snapshot request.
+    // An event snapshot is meaningful only if it has futures or a
+    // `last_device_output_` to wait on, must-execute deferred ops,
+    // must_materialize deferred constants (which bypass insertion into
+    // deferred_ops_), or a compiled execution task which have been recorded
+    // since the last snapshot request.
     PruneCompletedFutures(futures_);
-    bool is_no_op = futures_.empty();
+    bool is_no_op = futures_.empty() && !last_device_output_.has_value();
     PopNoOpWorkLocked(is_no_op);
 
     if (is_no_op && !ready_work_.empty() &&
@@ -574,6 +594,7 @@ class StreamState {
     last_snapshot_future_ = std::move(chaining_future);
     SnapshotRequest new_snapshot_request{
         .futures = std::move(futures_),
+        .last_device_output = std::exchange(last_device_output_, std::nullopt),
         .snapshot_promise = std::move(snapshot_promise),
     };
     ready_work_.push_back(std::move(new_snapshot_request));
@@ -585,6 +606,11 @@ class StreamState {
   xla::Future<void> last_snapshot_future_ ABSL_GUARDED_BY(mu_) =
       xla::Future<void>(absl::OkStatus());
   std::vector<xla::Future<void>> futures_ ABSL_GUARDED_BY(mu_);
+  // The most recent device-resident TensorCore output buffer written back by a
+  // MaterializationTask that finished without a trailing SnapshotRequest. Kept
+  // alive until transferred into the next SnapshotRequest or cleared by
+  // Clear().
+  std::optional<DeviceBufferRef> last_device_output_ ABSL_GUARDED_BY(mu_);
 
   std::deque<DeferredOpEvent> deferred_ops_ ABSL_GUARDED_BY(mu_);
   std::vector<ReadyWork> ready_work_ ABSL_GUARDED_BY(mu_);
@@ -1078,11 +1104,13 @@ void InsertGraphBreak(c10::DeviceIndex device_index, c10::StreamId stream_id,
       ->InsertGraphBreak(std::move(must_materialize), reason, mode, eager_mode);
 }
 
-void WriteBackMaterializationFutures(c10::DeviceIndex device_index,
-                                     c10::StreamId stream_id,
-                                     std::vector<xla::Future<void>>&& futures) {
+void WriteBackMaterializationFutures(
+    c10::DeviceIndex device_index, c10::StreamId stream_id,
+    std::vector<xla::Future<void>>&& futures,
+    std::optional<DeviceBufferRef> last_device_output) {
   GetOrCreateStreamState(device_index, stream_id)
-      ->WriteBackMaterializationFutures(std::move(futures));
+      ->WriteBackMaterializationFutures(std::move(futures),
+                                        std::move(last_device_output));
 }
 
 }  // namespace torch_tpu

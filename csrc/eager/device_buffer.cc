@@ -753,18 +753,44 @@ void DeviceBufferList::RecordChildOp(uint64_t child_index) const {
   }
 }
 
+namespace {
+
+// Obtains the ready future for a materialized `PjRtBuffer`, treating buffers
+// that were already deleted or donated before (or concurrently with)
+// `PjRtBuffer::GetReadyFuture()` as ready (`absl::OkStatus()`).
+//
+// Per the `xla::PjRtBuffer::GetReadyFuture()` contract, if a buffer is deleted
+// or donated at the time `GetReadyFuture()` is called, PJRT immediately returns
+// a ready future holding an error (`IsKnownReady() == true`), whereas if
+// `GetReadyFuture()` is called before deletion/donation, the returned future
+// tracks the underlying execution event and never fails due to subsequent
+// deletion/donation. Checking `buffer->IsDeleted()` only on a synchronous error
+// avoids an extra `IsDeleted()` call on the common non-deleted path while still
+// covering concurrent donation.
+xla::Future<void> GetPjRtBufferReadyFuture(
+    xla::PjRtBuffer* absl_nonnull buffer) {
+  auto ready_future = buffer->GetReadyFuture();
+  if (ready_future.IsKnownReady()) {
+    const absl::Status status = ready_future.Await();
+    if (!status.ok()) {
+      return buffer->IsDeleted() ? xla::Future<void>(absl::OkStatus())
+                                 : xla::Future<void>(AdaptXlaError(
+                                       status, "buffer failed to execute"));
+    }
+  }
+  return ready_future;
+}
+
+}  // namespace
+
 xla::Future<void> DeviceBufferRef::GetReadyFuture() const {
   if (GetMaterializationFuture().IsKnownReady()) {
     auto buffer_or = AwaitBuffer();
     if (!buffer_or.ok()) {
       return xla::Future<void>(buffer_or.status());
     }
-    auto ready_future = buffer_or.value()->GetReadyFuture();
+    auto ready_future = GetPjRtBufferReadyFuture(buffer_or.value());
     if (ready_future.IsKnownReady()) {
-      absl::Status status = ready_future.Await();
-      if (!status.ok()) {
-        return AdaptXlaError(status, "buffer failed to execute");
-      }
       return ready_future;
     }
     auto [promise, future] = xla::MakePromise<void>();
@@ -779,7 +805,7 @@ xla::Future<void> DeviceBufferRef::GetReadyFuture() const {
   auto [promise, future] = xla::MakePromise<void>();
   // Capture by value to extend lifetime.
   auto device_buffer_list = device_buffer_list_;
-  auto index = index_;
+  const auto index = index_;
   GetMaterializationFuture().OnReady([promise = std::move(promise),
                                       device_buffer_list =
                                           std::move(device_buffer_list),
@@ -793,7 +819,13 @@ xla::Future<void> DeviceBufferRef::GetReadyFuture() const {
       promise.Set(buffer_or.status());
       return;
     }
-    auto ready_future = buffer_or.value()->GetReadyFuture();
+    auto ready_future = GetPjRtBufferReadyFuture(buffer_or.value());
+    if (ready_future.IsKnownReady()) {
+      const absl::Status ready_status = ready_future.Await();
+      device_buffer_list.reset();
+      promise.Set(ready_status);
+      return;
+    }
     ready_future.OnReady([promise = std::move(promise),
                           device_buffer_list = std::move(device_buffer_list)](
                              const absl::Status& status) mutable {

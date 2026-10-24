@@ -278,7 +278,8 @@ class DeviceBufferRef {
 
   // Returns a future that is ready when the device has a PjRtBuffer with
   // ready data; this means that either the buffer has successfully finished
-  // execution, or has finished a host-to-device transfer.
+  // execution, has finished a host-to-device transfer, or has already been
+  // deleted/donated (resolving with `absl::OkStatus()`).
   [[nodiscard]] xla::Future<void> GetReadyFuture() const;
 
   // The DeviceBufferList that holds the referenced buffer.
