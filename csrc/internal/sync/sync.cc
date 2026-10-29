@@ -163,7 +163,7 @@ absl::StatusOr<absl_nonnull std::unique_ptr<Traversal>> GetTraversal(
   for (const DeviceBufferRef& buffer_ref : buffer_refs) {
     TT_RET_CHECK(!buffer_ref.is_placeholder(), error::kInternal)
         << "[GetTraversal] was called on a placeholder tensor. This should "
-           "never happen.";
+           "never happen";
     if (nodes_to_traverse_set.insert(buffer_ref.device_buffer_list().get())
             .second) {
       nodes_to_traverse.push_back(buffer_ref.device_buffer_list());
