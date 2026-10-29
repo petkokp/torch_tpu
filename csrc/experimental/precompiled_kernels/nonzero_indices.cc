@@ -194,9 +194,9 @@ class NonzeroKernel {
         n_(x.Dim(1)) {}
 
   void Build() {
-    fill_ = kiln::I32(0);
-    stage_rows_ = kiln::Zeros(kiln::i32(2 * kSublanes, kLanes));
-    stage_cols_ = kiln::Zeros(kiln::i32(2 * kSublanes, kLanes));
+    kiln::Store(fill_, kiln::I32(0));
+    kiln::Store(stage_rows_, kiln::Zeros(kiln::i32(2 * kSublanes, kLanes)));
+    kiln::Store(stage_cols_, kiln::Zeros(kiln::i32(2 * kSublanes, kLanes)));
     ZeroHighWords();
     ProcessInput();
     FinishOutput();
@@ -214,7 +214,7 @@ class NonzeroKernel {
     const Scalar half = rows >> 1;
     const Scalar end = rows - (half & (kZeroRows - 1));
     // Borrow the flush buffer as a zero source before any flush runs.
-    packed_ = kiln::Zeros(kiln::i32(2 * kSublanes, kLanes));
+    kiln::Store(packed_, kiln::Zeros(kiln::i32(2 * kSublanes, kLanes)));
     kiln::For(half, end, kZeroRows, [this](Scalar q) {
       kiln::SyncCopy(packed_, OutputRows(q, kZeroRows));
     });
@@ -285,8 +285,8 @@ class NonzeroKernel {
   Stream CompactTile(const Window& w, kiln::IndexArg slot, Scalar tile_idx,
                      Scalar row_in_block, Scalar row) {
     const Scalar offset = tile_idx * kTile;
-    const Tile values = Tile(buf_(slot, kiln::Slice(row_in_block, 1),
-                                  kiln::Slice(offset, kTile)))
+    const Tile values = kiln::Load(buf_(slot, kiln::Slice(row_in_block, 1),
+                                        kiln::Slice(offset, kTile)))
                             .Reshape({kSublanes, kLanes});
     const Scalar col0 = w.base + offset;
     const Tile flags = NonzeroFlags(values, row, col0);
@@ -346,7 +346,7 @@ class NonzeroKernel {
   // Stage up to 1024 pairs at `fill_ % 1024`; rows 8..15 hold overflow until
   // rows 0..7 flush.
   void Append(const Stream& stream) {
-    const Scalar fill = Scalar(fill_);
+    const Scalar fill = kiln::LoadScalar(fill_);
     const Scalar lane_offset = fill & (kLanes - 1);
     const Scalar stage_row = (fill >> kLaneShift) & (kSublanes - 1);
     const Tile rotated = stream.positions.Rotate(lane_offset, 1);
@@ -359,7 +359,7 @@ class NonzeroKernel {
     Stage(stage_row, body, stream);
     Stage(stage_row + kSublanes, tail, stream);
     const Scalar new_fill = fill + stream.total;
-    fill_ = new_fill;
+    kiln::Store(fill_, new_fill);
     kiln::If((new_fill >> kTileShift) > (fill >> kTileShift),
              [this, fill] { Flush((fill >> kTileShift) << kSublaneShift); });
   }
@@ -368,29 +368,32 @@ class NonzeroKernel {
   void Stage(Scalar first, Tile words, const Stream& stream) {
     const Tile live = (words & kAlive) != 0;
     const int64_t rows = words.dims()[0];
-    stage_rows_(kiln::Slice(first, rows)).Store(words.Splat(stream.row), live);
-    stage_cols_(kiln::Slice(first, rows))
-        .Store(stream.col0 + (words & (kTile - 1)), live);
+    kiln::Store(stage_rows_(kiln::Slice(first, rows)), words.Splat(stream.row),
+                {.mask = live});
+    kiln::Store(stage_cols_(kiln::Slice(first, rows)),
+                stream.col0 + (words & (kTile - 1)), {.mask = live});
   }
 
   // Interleave 1024 staged (row, col) pairs to HBM and shift overflow down.
   void Flush(Scalar q) {
     for (int r = 0; r < kSublanes; ++r) {
-      packed_(kiln::Slice(2 * r, 1)) = Tile(stage_rows_(kiln::Slice(r, 1)));
-      packed_(kiln::Slice(2 * r + 1, 1)) = Tile(stage_cols_(kiln::Slice(r, 1)));
+      kiln::Store(packed_(kiln::Slice(2 * r, 1)),
+                  kiln::Load(stage_rows_(kiln::Slice(r, 1))));
+      kiln::Store(packed_(kiln::Slice(2 * r + 1, 1)),
+                  kiln::Load(stage_cols_(kiln::Slice(r, 1))));
     }
     kiln::SyncCopy(packed_, OutputRows(2 * q, 2 * kSublanes));
     for (Ref stage : {stage_rows_, stage_cols_}) {
-      stage(kiln::Slice(0, kSublanes)) =
-          Tile(stage(kiln::Slice(kSublanes, kSublanes)));
-      stage(kiln::Slice(kSublanes, kSublanes)) =
-          kiln::Zeros(kiln::i32(kSublanes, kLanes));
+      kiln::Store(stage(kiln::Slice(0, kSublanes)),
+                  kiln::Load(stage(kiln::Slice(kSublanes, kSublanes))));
+      kiln::Store(stage(kiln::Slice(kSublanes, kSublanes)),
+                  kiln::Zeros(kiln::i32(kSublanes, kLanes)));
     }
   }
 
   // Flush any remaining partial stage rows within normal tile padding.
   void FinishOutput() {
-    const Scalar count = Scalar(fill_);
+    const Scalar count = kiln::LoadScalar(fill_);
     const Scalar q = (count >> kTileShift) << kSublaneShift;
     const Scalar rows = ((count & (kTile - 1)) + (kLanes - 1)) >> kLaneShift;
     kiln::For(rows, [this, q](Scalar r) {

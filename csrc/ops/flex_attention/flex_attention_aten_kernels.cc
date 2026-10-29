@@ -92,7 +92,7 @@ kiln::Scalar TableRow(const FlexAttnConfig& c) {
 
 // SMEM read: how many KV blocks this row attends to.
 kiln::Scalar NumListedBlocks(kiln::Ref kv_num_blocks, const FlexAttnConfig& c) {
-  return kiln::Scalar(kv_num_blocks(TableRow(c)));
+  return kiln::LoadScalar(kv_num_blocks(TableRow(c)));
 }
 
 // SMEM read: the KV block to visit at grid step j, kv_indices[row, j]. Steps
@@ -102,7 +102,7 @@ kiln::Scalar CurrentKvBlock(kiln::Ref kv_num_blocks, kiln::Ref kv_indices,
                             const FlexAttnConfig& c) {
   kiln::Scalar n = NumListedBlocks(kv_num_blocks, c);
   kiln::Scalar j = Min(kiln::ProgramId(kKvStepAxis), Max(n - 1, 0));
-  return kiln::Scalar(kv_indices(TableRow(c) * c.num_kv_blocks() + j));
+  return kiln::LoadScalar(kv_indices(TableRow(c) * c.num_kv_blocks() + j));
 }
 
 kiln::Scalar KvHead(const FlexAttnConfig& c) {
@@ -182,20 +182,20 @@ absl::StatusOr<kiln::Kernel> BuildFlexAttentionKernel(const FlexAttnConfig& c) {
 
         // Start of a row: reset the online-softmax state.
         kiln::If(j == 0, [&] {  // REF_CAPTURE_OK=called synchronously
-          m_ref = kiln::NInf(f32(c.q_block, kLanes));
-          l_ref = kiln::Zeros(f32(c.q_block, kLanes));
-          acc_ref = kiln::Zeros(f32(c.q_block, c.v_dim));
+          kiln::Store(m_ref, kiln::NInf(f32(c.q_block, kLanes)));
+          kiln::Store(l_ref, kiln::Zeros(f32(c.q_block, kLanes)));
+          kiln::Store(acc_ref, kiln::Zeros(f32(c.q_block, c.v_dim)));
         });
 
         // One listed KV block: fold its scores into (m, l, acc).
         kiln::If(j < n, [&] {  // REF_CAPTURE_OK=called synchronously
-          const kiln::Tile q = kiln::Tile(q_ref(0, 0));
-          const kiln::Tile k = kiln::Tile(k_ref(0, 0));
-          const kiln::Tile v = kiln::Tile(v_ref(0, 0));
+          const kiln::Tile q = kiln::Load(q_ref(0, 0));
+          const kiln::Tile k = kiln::Load(k_ref(0, 0));
+          const kiln::Tile v = kiln::Load(v_ref(0, 0));
           const kiln::Tile s = kiln::Dot(q, k, qk_options) * (c.scale * kLog2e);
 
-          const kiln::Tile m_prev = kiln::Tile(m_ref).Lanes(1);
-          const kiln::Tile l_prev = kiln::Tile(l_ref).Lanes(1);
+          const kiln::Tile m_prev = kiln::Load(m_ref).Lanes(1);
+          const kiln::Tile l_prev = kiln::Load(l_ref).Lanes(1);
           const kiln::Tile m_new = Max(m_prev, kiln::MaxReduce(s, 1));
           // Rows with no visible key yet have m == -inf; use 0 in the
           // exponents so they give exp2(-inf) = 0 rather than NaN.
@@ -203,23 +203,26 @@ absl::StatusOr<kiln::Kernel> BuildFlexAttentionKernel(const FlexAttnConfig& c) {
               Select(m_new == kiln::NInf(m_new.shape()), 0.0, m_new);
           const kiln::Tile alpha = Exp2(m_prev - m_safe);
           const kiln::Tile p = Exp2(s - m_safe);
-          acc_ref = kiln::Tile(acc_ref) * alpha +
-                    kiln::Dot(p.AsType(c.dtype), v, pv_options);
-          m_ref = m_new.Lanes(kLanes);
-          l_ref = (l_prev * alpha + kiln::SumReduce(p, 1)).Lanes(kLanes);
+          kiln::Store(acc_ref, kiln::Load(acc_ref) * alpha +
+                                   kiln::Dot(p.AsType(c.dtype), v, pv_options));
+          kiln::Store(m_ref, m_new.Lanes(kLanes));
+          kiln::Store(l_ref,
+                      (l_prev * alpha + kiln::SumReduce(p, 1)).Lanes(kLanes));
         });
 
         // End of the row: normalize and emit out / lse.
         kiln::If(j == nkv - 1, [&] {  // REF_CAPTURE_OK=called synchronously
-          const kiln::Tile l = kiln::Tile(l_ref).Lanes(1);
-          const kiln::Tile m = kiln::Tile(m_ref).Lanes(1);
+          const kiln::Tile l = kiln::Load(l_ref).Lanes(1);
+          const kiln::Tile m = kiln::Load(m_ref).Lanes(1);
           // Fully masked rows: out = 0 and lse = -inf, never NaN.
           const kiln::Tile is_empty = l == kiln::Zeros(l.shape());
           const kiln::Tile safe_l = Select(is_empty, 1.0, l);
-          out_ref(0, 0) =
-              (kiln::Tile(acc_ref) * kiln::Reciprocal(safe_l)).AsType(c.dtype);
-          lse_ref(0, 0) = kiln::Transpose(
-              Select(is_empty, kiln::NInf(m.shape()), m + Log2(safe_l)));
+          kiln::Store(
+              out_ref(0, 0),
+              (kiln::Load(acc_ref) * kiln::Reciprocal(safe_l)).AsType(c.dtype));
+          kiln::Store(lse_ref(0, 0),
+                      kiln::Transpose(Select(is_empty, kiln::NInf(m.shape()),
+                                             m + Log2(safe_l))));
         });
       });
 }
