@@ -169,17 +169,27 @@ torch_tpu_cc_library(
         ":dimension_types",
         ":dtype",
         ":error_utils",
+        ":shape",
         ":to_string",
+        "//csrc/pjrt:pjrt_state",
         "//shims/torch:aten_headers",
         "//shims/torch/c10/core:base_headers",
+        "@com_google_absl//absl/log:absl_log",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/types:span",
         "@stablehlo//stablehlo/integrations/cpp/builder:attr_type_builder_util",
+        "@xla//xla:shape_util",
+        "@xla//xla:util",
+        "@xla//xla:xla_data_proto_cc",
+        "@xla//xla/pjrt:pjrt_client",
     ],
 )
 
 torch_tpu_cc_test(
     name = "layout_utils_test",
     srcs = ["layout_utils_test.cc"],
+    exec_properties = {"cpp_link.mem": "16g"},  # multiline select
+    tags = ["requires-tpu-v5lite"],
     deps = [
         ":dimension_types",
         ":dtype",
