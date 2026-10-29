@@ -1962,6 +1962,14 @@ class TestOps(op_testing.OpInfoTestBase):
                     op_input.kwargs.get("per_sample_weights") is not None
                     or len(op_input.args) >= 8
                     and op_input.args[7] is not None
+                    # CUDA does not implement the max-mode backward for
+                    # bfloat16 (embedding_bag_backward_cuda_max), so there is
+                    # no GPU golden to compare against, while TorchTPU
+                    # supports it.
+                    or (
+                        op_input.input_value.dtype == torch.bfloat16
+                        and op_input.kwargs.get("mode") == "max"
+                    )
                 )
             )
         ),
