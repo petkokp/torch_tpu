@@ -4003,7 +4003,7 @@ class TestOps(op_testing.OpInfoTestBase):
         # TODO: _unique2 on 0D inputs with return_inverse=True produces a 1D
         # PjRtBuffer for a 0D ATen inverse_indices output tensor.
         skip_if=lambda _variant, op_input: (
-            not op_testing._CHECK_DYNAMISM_USING_SEED.value
+            not op_testing._CHECK_DYNAMISM.value
             and (
                 op_testing.is_compiled_mode()
                 or (

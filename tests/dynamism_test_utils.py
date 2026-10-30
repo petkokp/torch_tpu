@@ -25,7 +25,6 @@ from collections.abc import Mapping, Sequence
 import dataclasses
 import enum
 import itertools
-import random
 from typing import Any
 
 from absl import logging
@@ -47,20 +46,6 @@ class DynamismMode(enum.Enum):
 EAGER = DynamismMode.EAGER
 COMPILE = DynamismMode.COMPILE
 ALL_MODES = frozenset({DynamismMode.EAGER, DynamismMode.COMPILE})
-
-
-class DynamismCoverageMode(enum.Enum):
-  """Coverage strategy for selecting dynamic marking plans per sample.
-
-  Attributes:
-    RANDOM_DIM: Runs a single randomly chosen single-dimension plan per sample
-      (used to bound runtime for eager presubmits).
-    EXHAUSTIVE: Runs every candidate dimension individually plus simultaneous
-      multi-dimension plans in COMPILE mode.
-  """
-
-  RANDOM_DIM = "random_dim"
-  EXHAUSTIVE = "exhaustive"
 
 
 @dataclasses.dataclass(frozen=True, order=True)
@@ -819,25 +804,21 @@ class DynamicOpInfo:
 
   def mark_dynamic(
       self,
-      seed: int,
       input_value: torch.Tensor | Sequence[torch.Tensor],
       args: Sequence[Any],
       mode: DynamismMode = DynamismMode.EAGER,
       kwargs: Mapping[str, Any] | None = None,
       plan: DynamicMarkingPlan | None = None,
   ) -> None:
-    """Marks the op dynamic per `plan`, or on a random dim when `plan` is None.
+    """Marks the op dynamic per `plan`, or on the first candidate dim if `None`.
 
     Args:
-      seed: Deterministic RNG seed used to choose a candidate dimension when
-        `plan is None`.
       input_value: Primary tensor or sequence of tensors passed to the op.
       args: Additional positional arguments passed to the op.
       mode: Dynamism execution mode (`EAGER` or `COMPILE`).
       kwargs: Optional keyword arguments passed to the op.
       plan: Explicit `DynamicMarkingPlan` specifying which dimensions to mark
-        dynamic. When `None`, a single candidate `TensorDim` is chosen uniformly
-        at random using `seed`.
+        dynamic. When `None`, marks the first candidate `TensorDim`.
 
     Raises:
       ValueError: If `plan is None` and no candidate dynamic dimensions exist.
@@ -848,7 +829,7 @@ class DynamicOpInfo:
         raise ValueError(
             f"No dynamic marking plans available for {self.op_info.name}."
         )
-      chosen = random.Random(seed).choice(candidates)
+      chosen = candidates[0]
       plan = DynamicMarkingPlan(
           label=_format_plan_label((chosen,)),
           tensor_dims=(chosen,),
@@ -1001,7 +982,6 @@ class ForEachDynamicOpInfo(DynamicOpInfo):
 
   def mark_dynamic(
       self,
-      seed: int,
       input_value: torch.Tensor | Sequence[torch.Tensor],
       args: Sequence[Any],
       mode: DynamismMode = DynamismMode.EAGER,
@@ -1011,8 +991,6 @@ class ForEachDynamicOpInfo(DynamicOpInfo):
     """Overrides `DynamicOpInfo.mark_dynamic` for foreach tensor-list inputs.
 
     Args:
-      seed: Deterministic RNG seed forwarded when marking each tensor element in
-        `input_value`.
       input_value: Sequence of primary input tensors passed to the foreach op.
       args: Additional positional arguments (scalar or per-element tensor
         sequences).
@@ -1052,14 +1030,14 @@ class ForEachDynamicOpInfo(DynamicOpInfo):
           or not isinstance(args, (list, tuple))
           or not isinstance(args[0], (list, tuple))
       ):
-        super().mark_dynamic(seed, value, [], mode=mode)
+        super().mark_dynamic(value, [], mode=mode)
         continue
 
       # Binary ops expect len(args) == 1
       if self.op_info.name in foreach_binops:
         rhs_vals = args[0]
         BinaryElementwiseDynamicOpInfo(self.op_info).mark_dynamic(
-            seed, value, (rhs_vals[idx],), mode=mode
+            value, (rhs_vals[idx],), mode=mode
         )
         continue
 
@@ -1072,7 +1050,6 @@ class ForEachDynamicOpInfo(DynamicOpInfo):
         rhs_vals = args[0] if len(args) >= 1 else None
         ehs_vals = args[1] if len(args) >= 2 else None
         TernaryElementwiseDynamicOpInfo(self.op_info).mark_dynamic(
-            seed,
             value,
             (rhs_vals[idx], ehs_vals[idx]),  # pyrefly: ignore[unsupported-operation]
             mode=mode,
@@ -1080,7 +1057,7 @@ class ForEachDynamicOpInfo(DynamicOpInfo):
         continue
 
       # Not binary or ternary, no dependent args.
-      super().mark_dynamic(seed, value, [], mode=mode)
+      super().mark_dynamic(value, [], mode=mode)
       logging.debug(
           "[ForEachDynamicOpInfo] no dependent args %s",
           utils.InputMetadata(args),
@@ -1470,7 +1447,6 @@ def generate_exhaustive_input_marking_plans(
 
 
 def mark_input_dynamic(
-    seed: int,
     op_info: core.OpInfo,
     input_value: torch.Tensor | Sequence[torch.Tensor],
     args: Sequence[Any],
@@ -1481,15 +1457,13 @@ def mark_input_dynamic(
   """Mark an arg tensor as dynamic.
 
   Args:
-    seed: The seed used to choose a random candidate dimension when `plan` is
-      `None` (or per-element dimensions for foreach ops).
     op_info: The op to be tested.
     input_value: The primary input value to for the op test.
     args: The additional args to the op test.
     mode: The dynamism mode (EAGER or COMPILE).
     kwargs: The keyword arguments to the op test.
-    plan: Optional deterministic marking plan to apply. When `None`, marks a
-      single randomly chosen candidate dimension using `seed`.
+    plan: Optional deterministic marking plan to apply. When `None`, marks the
+      first candidate dimension.
   """
 
   dynamic_op_info = DynamicOpInfo.get(op_info)
@@ -1499,5 +1473,5 @@ def mark_input_dynamic(
       f" {type(dynamic_op_info)} (mode={mode.value})"
   )
   dynamic_op_info.mark_dynamic(
-      seed, input_value, args, mode=mode, kwargs=kwargs, plan=plan
+      input_value, args, mode=mode, kwargs=kwargs, plan=plan
   )

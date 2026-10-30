@@ -81,7 +81,6 @@ SampleInput = core.SampleInput  # pylint: disable=protected-access
 CheckValueMode = test_utils.CheckValueMode
 Tolerance = test_utils.Tolerance
 DynamismMode = dynamism_test_utils.DynamismMode
-DynamismCoverageMode = dynamism_test_utils.DynamismCoverageMode
 DynamicMarkingPlan = dynamism_test_utils.DynamicMarkingPlan
 
 AccuracyOverrides = Mapping[str, Mapping[torch.dtype, Mapping[str, Tolerance]]]
@@ -182,27 +181,12 @@ _IGNORE_ACCURACY_OVERRIDES: Final[flags.FlagHolder[bool]] = flags.DEFINE_bool(
     "If set, accuracy overrides will be ignored, forcing strict checks.",
 )
 
-_CHECK_DYNAMISM_USING_SEED: Final[flags.FlagHolder[int]] = flags.DEFINE_integer(
-    "check_dynamism_using_seed",
-    0,
-    "If non-zero, marks a random dimension as bounded dynamic and runs the ops "
-    "test, comparing the bounded TorchTPU result with the golden result. "
-    "Only picks dimensions with size >=2, "
-    "and bounds for size+10. Allows for explicitly setting the seed value for "
-    "reproducibility, or -1 for random seed.",
-)
-
-_DYNAMISM_COVERAGE_MODE: Final[flags.FlagHolder[DynamismCoverageMode]] = (
-    flags.DEFINE_enum_class(
-        "dynamism_coverage_mode",
-        DynamismCoverageMode.RANDOM_DIM,
-        DynamismCoverageMode,
-        "Coverage strategy for marking input dimensions dynamic when"
-        " --check_dynamism_using_seed is non-zero. 'random_dim' marks one"
-        " randomly chosen candidate dimension per sample; 'exhaustive' tests"
-        " every candidate dimension individually plus all candidate dimensions"
-        " simultaneously (in compile mode).",
-    )
+_CHECK_DYNAMISM: Final[flags.FlagHolder[bool]] = flags.DEFINE_bool(
+    "check_dynamism",
+    False,
+    "If set, marks candidate dimensions (size >= 2, upper bound size + 10) as"
+    " bounded dynamic across all valid marking plans and compares the bounded"
+    " TorchTPU result with the golden result.",
 )
 
 _DYNAMISM_PLAN_FILTER: Final[flags.FlagHolder[str]] = flags.DEFINE_string(
@@ -6903,7 +6887,6 @@ class OpInfoTestBase(TorchTpuTestBase):
       measure_perf: bool = False,
       out_dtype_override: torch.dtype | None = None,
       marking_plan: DynamicMarkingPlan | None = None,
-      dynamism_seed: int | None = None,
   ) -> Any:
     """Run the op on the given device.
 
@@ -6931,8 +6914,6 @@ class OpInfoTestBase(TorchTpuTestBase):
         out-variant dtype casting.
       marking_plan: Optional deterministic dynamic marking plan to apply when
         running in dynamic mode.
-      dynamism_seed: Optional deterministic seed used when applying or resolving
-        dynamic marking.
 
     Returns:
       When compute_grad is false: the result of the op, transferred to the CPU
@@ -6960,7 +6941,6 @@ class OpInfoTestBase(TorchTpuTestBase):
           use_compiled=use_compiled,
           out_dtype_override=out_dtype_override,
           marking_plan=marking_plan,
-          dynamism_seed=dynamism_seed,
       )
       if isinstance(out, Exception):
         return out
@@ -6975,9 +6955,10 @@ class OpInfoTestBase(TorchTpuTestBase):
       device_op_input.kwargs["out"] = out
 
     is_dynamic_test = bool(
-        _CHECK_DYNAMISM_USING_SEED.value and device == torch.device("tpu")
+        _CHECK_DYNAMISM.value and device == torch.device("tpu")
     )
     if is_dynamic_test:
+      assert marking_plan is not None
       self._mark_dynamic(
           op,
           variant,
@@ -6986,7 +6967,6 @@ class OpInfoTestBase(TorchTpuTestBase):
           device_op_input,
           use_compiled=use_compiled,
           marking_plan=marking_plan,
-          dynamism_seed=dynamism_seed,
       )
     if use_compiled:
       op_func = self._compile(
@@ -7075,7 +7055,6 @@ class OpInfoTestBase(TorchTpuTestBase):
       use_compiled: bool,
       out_dtype_override: torch.dtype | None,
       marking_plan: DynamicMarkingPlan | None = None,
-      dynamism_seed: int | None = None,
   ) -> Any:
     """Returns the out argument for running the out variant of the op.
 
@@ -7101,7 +7080,6 @@ class OpInfoTestBase(TorchTpuTestBase):
         # itself, so don't measure its performance to avoid skewing metrics.
         measure_perf=False,
         marking_plan=marking_plan,
-        dynamism_seed=dynamism_seed,
     )
     if isinstance(base_result, Exception):
       return base_result
@@ -7124,8 +7102,7 @@ class OpInfoTestBase(TorchTpuTestBase):
       device_op_input: OpInput,
       *,
       use_compiled: bool,
-      marking_plan: DynamicMarkingPlan | None = None,
-      dynamism_seed: int | None = None,
+      marking_plan: DynamicMarkingPlan,
   ) -> None:
     """Marks dimensions of `device_op_input` dynamic, or skips the test."""
     op_name = _op_name_for_logging(op, variant)
@@ -7143,20 +7120,11 @@ class OpInfoTestBase(TorchTpuTestBase):
     if skip is not None:
       self.skipTest(skip)
 
-    if dynamism_seed is None:
-      seed = _CHECK_DYNAMISM_USING_SEED.value
-      dynamism_seed = seed if seed > 0 else (time.time_ns() % 100000)
-    plan_flag = (
-        f" --dynamism_plan_filter={marking_plan.label}"
-        if marking_plan is not None
-        else ""
-    )
     print(
-        f">>>> Reproduce using `--check_dynamism_using_seed={dynamism_seed}"
-        f"{plan_flag}`"
+        ">>>> Reproduce using"
+        f" `--check_dynamism --dynamism_plan_filter={marking_plan.label}`"
     )
     self.dynamism_mark_dynamic_fn(
-        dynamism_seed,
         op,
         device_op_input.input_value,
         device_op_input.args,
@@ -7703,10 +7671,8 @@ class OpInfoTestBase(TorchTpuTestBase):
             check_dtype=check_dtype,
             skip_output_indices=skip_output_indices,
         )
-      dynamism_skip, dynamism_seed, marking_plans = (
-          self._resolve_dynamism_plans(
-              op, golden_input, use_compiled=use_compiled
-          )
+      dynamism_skip, marking_plans = self._resolve_dynamism_plans(
+          op, golden_input, use_compiled=use_compiled
       )
       if dynamism_skip is not None:
         self._subtests_run += 1
@@ -7716,14 +7682,10 @@ class OpInfoTestBase(TorchTpuTestBase):
           )
         continue
 
-      append_plan_label = bool(
-          _DYNAMISM_PLAN_FILTER.value
-          or _DYNAMISM_COVERAGE_MODE.value == DynamismCoverageMode.EXHAUSTIVE
-      )
       for marking_plan in marking_plans:
         plan_subtest_name = (
             f"{subtest_name}_{marking_plan.label}"
-            if append_plan_label and marking_plan is not None
+            if marking_plan is not None
             else subtest_name
         )
         for perf_run_idx in range(_NUM_RUNS_PER_SUBTEST.value):
@@ -7744,7 +7706,6 @@ class OpInfoTestBase(TorchTpuTestBase):
                     use_compiled=use_compiled,
                     out_dtype_override=out_dtype_override,
                     marking_plan=marking_plan,
-                    dynamism_seed=dynamism_seed,
                 )
             )
 
@@ -7754,8 +7715,8 @@ class OpInfoTestBase(TorchTpuTestBase):
       golden_input: OpInput,
       *,
       use_compiled: bool,
-  ) -> tuple[str | None, int | None, Sequence[DynamicMarkingPlan | None]]:
-    """Resolves dynamism skip reason, seed, and marking plans for a sample.
+  ) -> tuple[str | None, Sequence[DynamicMarkingPlan | None]]:
+    """Resolves dynamism skip reason and marking plans for a sample.
 
     Args:
       op: The `OpInfo` descriptor for the operator under test.
@@ -7764,24 +7725,21 @@ class OpInfoTestBase(TorchTpuTestBase):
       use_compiled: Whether the test is running under `torch.compile`.
 
     Returns:
-      A `(skip_reason, dynamism_seed, plans)` tuple:
-        - `(None, None, (None,))` when bounded dynamism checking is inactive.
-        - `(reason, None, ())` when the sample should be skipped.
-        - `(None, seed, plans)` with the non-empty sequence of
-          `DynamicMarkingPlan`s to execute when the sample is eligible.
+      A `(skip_reason, plans)` tuple:
+        - `(None, (None,))` when bounded dynamism checking is inactive.
+        - `(reason, ())` when the sample should be skipped.
+        - `(None, plans)` with the non-empty sequence of `DynamicMarkingPlan`s
+          to execute when the sample is eligible.
     """
-    if not _CHECK_DYNAMISM_USING_SEED.value or _CHECK_SYMBOLIC_SHAPES.value:
-      return None, None, (None,)
+    if not _CHECK_DYNAMISM.value or _CHECK_SYMBOLIC_SHAPES.value:
+      return None, (None,)
 
     dynamism_mode = DynamismMode.COMPILE if use_compiled else DynamismMode.EAGER
     skip = self.dynamism_filter_fn(
         op, golden_input.input_value, golden_input.args, mode=dynamism_mode
     )
     if skip is not None:
-      return skip, None, ()
-
-    seed = _CHECK_DYNAMISM_USING_SEED.value
-    seed = seed if seed > 0 else (time.time_ns() % 100000)
+      return skip, ()
 
     plans = list(
         self.dynamism_generate_plans_fn(
@@ -7792,7 +7750,7 @@ class OpInfoTestBase(TorchTpuTestBase):
         )
     )
     if not plans:
-      return "No valid input dimensions to mark dynamic.", None, ()
+      return "No valid input dimensions to mark dynamic.", ()
 
     plan_filter = _DYNAMISM_PLAN_FILTER.value
     if plan_filter:
@@ -7805,16 +7763,10 @@ class OpInfoTestBase(TorchTpuTestBase):
                 f" --dynamism_plan_filter={plan_filter!r} (available:"
                 f" {available})."
             ),
-            None,
             (),
         )
-      return None, seed, tuple(plans)
 
-    if _DYNAMISM_COVERAGE_MODE.value == DynamismCoverageMode.RANDOM_DIM:
-      single_dim_plans = [p for p in plans if len(p.tensor_dims) <= 1] or plans
-      plans = [random.Random(seed).choice(single_dim_plans)]
-
-    return None, seed, tuple(plans)
+    return None, tuple(plans)
 
   def _assert_known_symbolic_shapes_failure_seen(
       self, op_name: str, variant_test_name: str | None
@@ -8332,13 +8284,13 @@ def set_up_test_module() -> None:
       not _torch_tpu_vs_gpu_mode()
       or is_compiled_mode()
       or _COMPUTE_GRAD.value
-      or _CHECK_DYNAMISM_USING_SEED.value
+      or _CHECK_DYNAMISM.value
   ):
     raise ValueError(
         "--check_symbolic_shapes reads the GPU golden inputs of the"
         " torch_tpu_vs_gpu test mode and checks gradients itself, so it can't"
         " be combined with another --test_mode, --use_compiled,"
-        " --compute_grad or --check_dynamism_using_seed."
+        " --compute_grad or --check_dynamism."
     )
   if _CHECK_SYMBOLIC_SHAPES.value:
     # Don't log every symbol and guard that the checks create.
